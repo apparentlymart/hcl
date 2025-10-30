@@ -22,6 +22,16 @@ type parser struct {
 	// in recovery mode, assuming that the recovery heuristics have failed
 	// in this case and left the peeker in a wrong place.
 	recovery bool
+
+	// lexicalScopes is a stack of lexical scopes that is extended whenever
+	// a lexical-scope-creating node contains at least one lexical symbol
+	// definition, using the syntax: @name = expr
+	//
+	// New scopes are created here only once encountering the first lexical
+	// symbol definition inside a particular node, so we only need to
+	// allocate backing storage for this when lexical symbols are actually
+	// present (which is likely to be pretty rare in most HCL applications).
+	lexicalScopes []map[string]Expression
 }
 
 func (p *parser) ParseBody(end TokenType) (*Body, hcl.Diagnostics) {
@@ -140,6 +150,9 @@ Token:
 
 func (p *parser) ParseBodyItem() (Node, hcl.Diagnostics) {
 	ident := p.Read()
+	if tokenStartsLexicalDef(ident) {
+		return p.finishParsingLexicalDef(ident)
+	}
 	if ident.Type != TokenIdent {
 		p.recoverAfterBodyItem()
 		return nil, hcl.Diagnostics{
@@ -178,6 +191,17 @@ func (p *parser) ParseBodyItem() (Node, hcl.Diagnostics) {
 // immediately followed by the end token type with no intervening newlines.
 func (p *parser) parseSingleAttrBody(end TokenType) (*Body, hcl.Diagnostics) {
 	ident := p.Read()
+	if tokenStartsLexicalDef(ident) {
+		p.recoverAfterBodyItem()
+		return nil, hcl.Diagnostics{
+			{
+				Severity: hcl.DiagError,
+				Summary:  "Argument or block definition required",
+				Detail:   "Cannot define lexical symbols in the single-line block syntax. Use multi-line block syntax when lexical symbols are needed.",
+				Subject:  &ident.Range,
+			},
+		}
+	}
 	if ident.Type != TokenIdent {
 		p.recoverAfterBodyItem()
 		return nil, hcl.Diagnostics{
@@ -2064,6 +2088,155 @@ Slices:
 	}
 
 	return string(ret), diags
+}
+
+// ensureLexicalScope checks whether the given pointer refers to a nil map,
+// and if so it pushes a new scope onto p.lexicalScopes and writes that
+// scope through the given pointer.
+//
+// If the target of the pointer is already a non-nil map then this does
+// nothing at all. Note that the storage pointer itself must NEVER be nil; only
+// the target map can be nil.
+//
+// Any use of this method MUST be paired with a call to
+// [parser.maybePopLexicalScope] with the same pointer value, to ensure that
+// the newly-created scope gets discarded once it is no longer needed.
+func (p *parser) ensureLexicalScope(storage *map[string]Expression) {
+	if *storage != nil {
+		return // a previous call already did the work
+	}
+	p.lexicalScopes = append(p.lexicalScopes, make(map[string]Expression))
+	*storage = p.lexicalScopes[len(p.lexicalScopes)-1]
+}
+
+// maybePopLexicalScope checks whether the given pointer refers to a non-nil
+// map, and if so it pops one entry from p.lexicalScopes to mark the end
+// of the use of the current lexical scope.
+//
+// This does nothing at all if the target of the pointer is a nil map. Note that
+// the storage pointer itself must NEVER be nil; only the target map can be nil.
+//
+// Use this only in conjunction with [parser.ensureLexicalScope], in pairs
+// that ensure correct stack manipulation discipline. This function does not
+// (and cannot) check that the given pointer is actually referring to the
+// same map as the top entry on the lexical scope stack.
+func (p *parser) maybePopLexicalScope(storage *map[string]hcl.Expression) {
+	if *storage == nil {
+		return // p.ensureLexicalScope wasn't called, so there's nothing to undo
+	}
+	p.lexicalScopes = p.lexicalScopes[:len(p.lexicalScopes)-1]
+	// Correctly-written callers ought not to access their map again after
+	// calling this function anyway, but we'll nil out the map just to make
+	// it more likely for a mistake to be caught.
+	*storage = nil
+}
+
+func tokenStartsLexicalDef(tok Token) bool {
+	return tok.Type == TokenAt
+}
+
+// parseLexicalDef parses a lexical symbol definition, which must begin with
+// the "@" sigil, and writes it into the given map.
+//
+// The caller must ensure that the given map is not nil. This is typically
+// achieved by calling [parser.ensureLexicalScope] with a pointer to a local
+// variable that represents the scope, coupled with a call to
+// [parser.maybePopLexicalScope] to discard the scope when it's no longer
+// needed.
+//
+// The parsing of a lexical definition is similar to the parsing of a
+// "body item", so this production should only be used in parts of the grammar
+// where a body item could potentially be parsed unambiguously (a body item
+// does not necessarily need to actually be allowed in that location).
+func (p *parser) parseLexicalDef(scope map[string]hcl.Expression) hcl.Diagnostics {
+	if startTok := p.Peek(); !tokenStartsLexicalDef(startTok) {
+		var diags hcl.Diagnostics
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Lexical definition required",
+			Detail:   "A lexical definition is required, beginning with the \"@\" symbol.",
+			Subject:  &startTok.Range,
+		})
+		return diags
+	}
+	return p.finishParsingLexicalDef(p.Read(), scope)
+}
+
+// finishParsingLexicalDef deals with the part of a lexical definition that
+// appears after consuming a token for which [tokenStartsLexicalDef] returns
+// true.
+func (p *parser) finishParsingLexicalDef(startTok Token, scope map[string]hcl.Expression) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+	nameTok := p.Read()
+	if nameTok.Type != TokenIdent {
+		var diags hcl.Diagnostics
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid lexical symbol name",
+			Detail:   "The name of a lexical symbol must be a valid identifier.",
+			Subject:  &nameTok.Range,
+		})
+		p.recoverAfterBodyItem() // a lexical def is similar enough to a body item
+		return diags
+	}
+	if eqTok := p.Read(); eqTok.Type != TokenEqual {
+		var diags hcl.Diagnostics
+		diags = diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid lexical symbol definition",
+			Detail:   "The name of the symbol must be followed by an equals sign to introduce the symbol's expression.",
+			Subject:  &eqTok.Range,
+		})
+		p.recoverAfterBodyItem() // a lexical def is similar enough to a body item
+		return diags
+	}
+
+	var endRange hcl.Range
+	targetExpr, moreDiags := p.ParseExpression()
+	diags = append(diags, moreDiags...)
+	if p.recovery && moreDiags.HasErrors() {
+		// recovery within expressions tends to be tricky, so we've probably
+		// landed somewhere weird. We'll try to reset to the start of a body
+		// item so parsing can continue.
+		endRange = p.PrevRange()
+		p.recoverAfterBodyItem()
+	} else {
+		endRange = p.PrevRange()
+		end := p.Peek()
+		if end.Type != TokenNewline && end.Type != TokenEOF {
+			if !p.recovery {
+				var summary, detail string
+				switch end.Type {
+				case TokenComma:
+					summary = "Unexpected comma after lexical symbol definition"
+					detail = "Lexical symbol definitions must be separated by newlines, not commas."
+				case TokenSemicolon:
+					summary = "Unexpected semicolon after lexical symbol definition"
+					detail = "Lexical symbol definitions must be separated by newlines, not semicolons."
+				default:
+					summary = "Missing newline after lexical symbol definition"
+					detail = "A lexical symbol definition must end with a newline."
+				}
+
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  summary,
+					Detail:   detail,
+					Subject:  &end.Range,
+					Context:  hcl.RangeBetween(startTok.Range, end.Range).Ptr(),
+				})
+			}
+			endRange = p.PrevRange()
+			p.recoverAfterBodyItem()
+		} else {
+			endRange = p.PrevRange()
+			p.Read() // eat newline
+		}
+	}
+	if diags.HasErrors() {
+		return diags
+	}
+	return diags
 }
 
 // setRecovery turns on recovery mode without actually doing any recovery.

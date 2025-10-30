@@ -432,6 +432,37 @@ func TestScanTokens_normal(t *testing.T) {
 			},
 		},
 
+		// References to lexical symbols, with the "@" sigil
+		{
+			`@foo`,
+			[]Token{
+				{
+					Type:  TokenAt,
+					Bytes: []byte(`@`),
+					Range: hcl.Range{
+						Start: hcl.Pos{Byte: 0, Line: 1, Column: 1},
+						End:   hcl.Pos{Byte: 1, Line: 1, Column: 2},
+					},
+				},
+				{
+					Type:  TokenIdent,
+					Bytes: []byte(`foo`),
+					Range: hcl.Range{
+						Start: hcl.Pos{Byte: 1, Line: 1, Column: 2},
+						End:   hcl.Pos{Byte: 4, Line: 1, Column: 5},
+					},
+				},
+				{
+					Type:  TokenEOF,
+					Bytes: []byte(``),
+					Range: hcl.Range{
+						Start: hcl.Pos{Byte: 4, Line: 1, Column: 5},
+						End:   hcl.Pos{Byte: 4, Line: 1, Column: 5},
+					},
+				},
+			},
+		},
+
 		// Literal-only Templates (string literals, effectively)
 		{
 			`""`,

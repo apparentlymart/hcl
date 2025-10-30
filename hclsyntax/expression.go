@@ -2052,6 +2052,106 @@ func (e *AnonSymbolExpr) StartRange() hcl.Range {
 	return e.SrcRange
 }
 
+// LexicalSymbolDef is the definition of a lexical symbol.
+//
+// These are included in the AST only for the benefit of analysis tools. HCL
+// resolves references to lexical symbols during the parsing step, so the
+// actual definitions are not directly useful during evaluation.
+type LexicalSymbolDef struct {
+	// Name is the name of the lexical symbol that is being defined, without
+	// the leading "@" sigil.
+	Name string
+	// Expr is the expression associated with the lexical symbol.
+	Expr Expression
+	// SrcRange is the source range of the entire definition, including
+	// the "@" sigil and the associated expression.
+	SrcRange hcl.Range
+	// DeclRange is the source range associated with the "@name" part of
+	// the definition, intended providing "Go to Declaration"-like features
+	// in analysis tools.
+	NameRange hcl.Range
+}
+
+func (d *LexicalSymbolDef) walkChildNodes(w internalWalkFunc) {
+	w(d.Expr)
+}
+
+func (d *LexicalSymbolDef) Range() hcl.Range {
+	return d.SrcRange
+}
+
+func (d *LexicalSymbolDef) StartRange() hcl.Range {
+	return d.NameRange
+}
+
+// ExprLexicalRef is a reference to a lexical symbol, using the @name syntax.
+//
+// This wrapper is here only to help callers relying on AST analysis to
+// distinguish a lexical symbol reference from an inline expression, but
+// functionally it should be treated as exactly equivalent to the expression
+// it wraps, which is the expression associated with the symbol.
+type ExprLexicalRef struct {
+	// Name is the name of the symbol that the expression refers to, without
+	// the leading "@" sigil.
+	Name string
+	// Target is the definition of the symbol being referred to, or nil
+	// if name resolution failed during parsing.
+	Target *LexicalSymbolDef
+	// SrcRange is the source range of the reference itself, including both
+	// the "@" sigil and the symbol name.
+	SrcRange hcl.Range
+}
+
+// Value evaluates the target expression and returns its result.
+func (e *ExprLexicalRef) Value(ctx *hcl.EvalContext) (cty.Value, hcl.Diagnostics) {
+	if e.Target == nil {
+		// We should only get here if there was a symbol lookup failure
+		// during parsing, in which case callers should not typically try
+		// to evaluate expressions anyway, but this is here for robustness
+		// just in case someone tries. It produces an error that's redundant
+		// with the one that would've been returned during parsing.
+		var diags hcl.Diagnostics
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Reference to undefined lexical symbol",
+			Detail:   fmt.Sprintf("There is no lexical symbol named @%s in the current scope.", e.Name),
+			Subject:  &e.SrcRange,
+		})
+		return cty.DynamicVal, diags
+	}
+	// For any valid reference, we just behave as if the target expression
+	// had been written inline.
+	return e.Target.Expr.Value(ctx)
+}
+
+func (e *ExprLexicalRef) walkChildNodes(w internalWalkFunc) {
+	w(e.Target)
+}
+
+// Range returns the source range of the reference itself, as opposed to the
+// range of the target of the reference.
+func (e *ExprLexicalRef) Range() hcl.Range {
+	return e.SrcRange
+}
+
+// Range returns the source range of the reference itself, as opposed to the
+// range of the target of the reference.
+func (e *ExprLexicalRef) StartRange() hcl.Range {
+	return e.SrcRange
+}
+
+// UnwrapExpression returns the expression associated with the lexical symbol
+// that the expression refers to.
+//
+// This makes this expression type transparent to static analysis operations
+// like [hcl.AbsTraversalForExpr], [hcl.ExprList], etc, so that lexical symbols
+// can also be used as part of static-analysis-based "microsyntaxes", as long
+// as the expression associated with the symbol has a suitable structure for
+// whereever the reference appears.
+func (e *ExprLexicalRef) UnwrapExpression() Expression {
+	return e.Target
+}
+
 // ExprSyntaxError is a placeholder for an invalid expression that could not
 // be parsed due to syntax errors.
 type ExprSyntaxError struct {

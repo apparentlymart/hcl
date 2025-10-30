@@ -60,6 +60,7 @@ const (
 	TokenOr   TokenType = '∨'
 	TokenBang TokenType = '!'
 
+	TokenAt    TokenType = '@'
 	TokenDot   TokenType = '.'
 	TokenComma TokenType = ','
 
